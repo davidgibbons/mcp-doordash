@@ -10,9 +10,13 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer as createHttpServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
   checkAuth,
@@ -29,21 +33,58 @@ import {
 } from "./browser.js";
 import { hasStoredCookies, clearCookies, getCookiesPath } from "./auth.js";
 
-// Initialize server
-const server = new Server(
-  {
-    name: "strider-doordash",
-    version: "0.1.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
+// Every tool call drives the same singleton browser tab, and the flows are
+// stateful across calls (add_to_cart assumes menu already navigated there), so
+// concurrent callers must not interleave.
+let queue: Promise<unknown> = Promise.resolve();
+export function serialize<T>(fn: () => Promise<T>): Promise<T> {
+  const run = queue.then(fn, fn);
+  queue = run.catch(() => {});
+  return run;
+}
+
+let lastToolAt = 0;
+export function noteToolActivity(): void {
+  lastToolAt = Date.now();
+}
+
+/**
+ * Keep an idle session warm. DoorDash cookies go stale in a container nobody
+ * is ordering from, and you find out when you are hungry. A beat re-navigates
+ * and re-saves the cookies, and logs loudly once the session is beyond saving.
+ *
+ * Beats are skipped whenever a tool ran during the interval: those already
+ * refreshed the cookies, and checkAuth navigates the one shared tab, which
+ * would strand a caller midway through menu -> add_to_cart.
+ */
+export function startHeartbeat(
+  hours: number,
+  probe: () => Promise<{ isLoggedIn: boolean }> = checkAuth
+): void {
+  const schedule = () => {
+    // +/-25% so the beat is not a metronome DoorDash can pick out.
+    const delay = hours * 3600_000 * (0.75 + Math.random() * 0.5);
+    setTimeout(async () => {
+      if (Date.now() - lastToolAt >= delay) {
+        try {
+          const { isLoggedIn } = await serialize(probe);
+          if (!isLoggedIn) {
+            console.error(
+              "Heartbeat: DoorDash session is stale. Re-run `npm run login` and restart."
+            );
+          }
+        } catch (error) {
+          console.error("Heartbeat failed:", error);
+        }
+      }
+      schedule();
+    }, delay).unref();
+  };
+  schedule();
+}
 
 // Tool definitions
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+const listTools = async () => {
   return {
     tools: [
       {
@@ -195,10 +236,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
     ],
   };
-});
+};
 
 // Tool execution
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+const callTool = async (request: CallToolRequest) => {
   const { name, arguments: args } = request.params;
 
   try {
@@ -428,7 +469,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
-});
+};
+
+function createServer(): Server {
+  const server = new Server(
+    {
+      name: "strider-doordash",
+      version: "0.1.0",
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    }
+  );
+  server.setRequestHandler(ListToolsRequestSchema, listTools);
+  server.setRequestHandler(CallToolRequestSchema, (request) =>
+    serialize(async () => {
+      noteToolActivity();
+      try {
+        return await callTool(request);
+      } finally {
+        noteToolActivity();
+      }
+    })
+  );
+  return server;
+}
 
 // Cleanup on exit
 process.on("SIGINT", async () => {
@@ -441,10 +508,58 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-// Start server
+function tokenMatches(header: string | undefined, token: string): boolean {
+  const given = Buffer.from((header ?? "").replace(/^Bearer /, ""));
+  const want = Buffer.from(token);
+  return given.length === want.length && timingSafeEqual(given, want);
+}
+
+/**
+ * Stateless Streamable HTTP: a fresh Server and transport per request. All the
+ * real state lives in the browser singleton, not in the MCP session, so there
+ * is nothing to keep between requests.
+ */
+async function serveHttp(port: number) {
+  const token = process.env.MCP_HTTP_TOKEN;
+  if (!token) {
+    console.error("MCP_HTTP_TOKEN is required when MCP_HTTP_PORT is set - this server can spend money.");
+    process.exit(1);
+  }
+  const host = process.env.MCP_HTTP_HOST ?? "127.0.0.1";
+  const heartbeatHours = Number(process.env.DOORDASH_HEARTBEAT_HOURS);
+  if (heartbeatHours > 0) startHeartbeat(heartbeatHours);
+
+  createHttpServer(async (req, res) => {
+    // Unauthenticated so a container probe needs no token. Says only "alive" -
+    // it does not check the DoorDash session, which the heartbeat logs about.
+    if (req.method === "GET" && req.url === "/healthz") {
+      res.writeHead(200).end("ok");
+      return;
+    }
+    if (!tokenMatches(req.headers.authorization, token)) {
+      res.writeHead(401).end("unauthorized");
+      return;
+    }
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+    res.on("close", () => transport.close());
+    await createServer().connect(transport);
+    await transport.handleRequest(req, res);
+  }).listen(port, host, () => {
+    console.error(`Strider DoorDash MCP server listening on http://${host}:${port}`);
+  });
+}
+
 async function main() {
+  const port = Number(process.env.MCP_HTTP_PORT);
+  if (port) {
+    await serveHttp(port);
+    return;
+  }
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createServer().connect(transport);
   console.error("Strider DoorDash MCP server running");
 }
 

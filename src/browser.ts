@@ -64,10 +64,23 @@ export interface OrderStatus {
  * Initialize browser with stealth settings
  */
 async function initBrowser(): Promise<void> {
-  if (browser) return;
+  if (browser?.isConnected()) return;
+
+  // Chromium dies under long-running containers (OOM, a crashed tab, a stray
+  // SIGKILL). Without this the stale handle is truthy forever and every later
+  // call fails until someone restarts the process.
+  if (browser) {
+    console.error("Browser disconnected - relaunching.");
+    browser = null;
+    context = null;
+    page = null;
+  }
 
   browser = await chromium.launch({
-    headless: false,
+    // Visible by default so the interactive login flow works. Hosted
+    // deployments set DOORDASH_HEADLESS=1; patchright's stealth is weaker
+    // headless, so verify DoorDash still serves you before relying on it.
+    headless: process.env.DOORDASH_HEADLESS === "1",
     args: [
       "--disable-blink-features=AutomationControlled",
       "--no-sandbox",
@@ -99,6 +112,10 @@ async function initBrowser(): Promise<void> {
  */
 async function getPage(): Promise<Page> {
   await initBrowser();
+  if (page?.isClosed() && context) {
+    page = await context.newPage();
+    page.setDefaultTimeout(DEFAULT_TIMEOUT);
+  }
   if (!page) throw new Error("Page not initialized");
   return page;
 }

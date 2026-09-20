@@ -33,9 +33,16 @@ function ensureConfigDir(): void {
  * Save cookies from browser context to disk
  */
 export async function saveCookies(context: BrowserContext): Promise<void> {
-  ensureConfigDir();
   const cookies = await context.cookies();
-  writeFileSync(COOKIES_FILE, JSON.stringify(cookies, null, 2));
+  try {
+    ensureConfigDir();
+    writeFileSync(COOKIES_FILE, JSON.stringify(cookies, null, 2));
+  } catch (error) {
+    // Every tool refreshes cookies after it runs. A read-only cookie store (a
+    // Secret mounted straight onto the file) must not fail the order that just
+    // succeeded - the in-memory session keeps working until the process exits.
+    console.error("Could not persist cookies:", error);
+  }
 }
 
 /**
