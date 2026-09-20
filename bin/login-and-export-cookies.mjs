@@ -14,6 +14,7 @@
 
 import { chromium } from "patchright";
 import { loadCookies, saveCookies, getCookiesPath } from "../dist/auth.js";
+import { sessionIsLive } from "../dist/browser.js";
 
 const DOORDASH_BASE_URL = "https://www.doordash.com";
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -27,7 +28,10 @@ function parseArgs(argv) {
   return opts;
 }
 
-async function isLoggedIn(page) {
+// Weak on purpose: used only to spot that the login form is gone, so polling
+// never navigates and never interrupts an in-progress email/OTP entry.
+// sessionIsLive() is what actually decides, once below.
+async function signInGone(page) {
   const signInVisible = await page
     .locator('button:has-text("Sign In"), a:has-text("Sign In"), text="Sign in or Sign up"')
     .first()
@@ -70,7 +74,7 @@ async function main() {
   // entry never gets interrupted mid-flow.
   while (Date.now() - start < LOGIN_TIMEOUT_MS) {
     await page.waitForTimeout(4000);
-    loggedIn = (await isLoggedIn(page)) && !page.url().includes("/consumer/login");
+    loggedIn = (await signInGone(page)) && !page.url().includes("/consumer/login");
     if (loggedIn) break;
   }
 
@@ -80,11 +84,8 @@ async function main() {
     process.exit(1);
   }
 
-  // One confirmatory check on the homepage to rule out false positives
-  // (e.g. a transient state on the login page itself).
-  await page.goto(DOORDASH_BASE_URL, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2000);
-  if (!(await isLoggedIn(page))) {
+  // Then prove the session actually works, rather than trusting a missing button.
+  if (!(await sessionIsLive(page))) {
     console.error("Login did not persist - please try again.");
     await browser.close();
     process.exit(1);

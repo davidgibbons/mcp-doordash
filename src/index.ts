@@ -61,19 +61,27 @@ export function startHeartbeat(
   hours: number,
   probe: () => Promise<{ isLoggedIn: boolean }> = checkAuth
 ): void {
+  let misses = 0;
   const schedule = () => {
-    // +/-25% so the beat is not a metronome DoorDash can pick out.
-    const delay = hours * 3600_000 * (0.75 + Math.random() * 0.5);
+    // +/-25% so the beat is not a metronome DoorDash can pick out, and each
+    // consecutive failure doubles the wait up to 4x (24h at the image default).
+    // Nothing a beat does fixes a stale session or an IP DoorDash has started
+    // blocking - only `npm run login` does - so retrying at full rate is just
+    // more of whatever got us here.
+    const delay =
+      hours * 3600_000 * Math.min(2 ** misses, 4) * (0.75 + Math.random() * 0.5);
     setTimeout(async () => {
       if (Date.now() - lastToolAt >= delay) {
         try {
           const { isLoggedIn } = await serialize(probe);
+          misses = isLoggedIn ? 0 : misses + 1;
           if (!isLoggedIn) {
             console.error(
               "Heartbeat: DoorDash session is stale. Re-run `npm run login` and restart."
             );
           }
         } catch (error) {
+          misses++;
           console.error("Heartbeat failed:", error);
         }
       }

@@ -5,7 +5,7 @@
  */
 
 import { chromium, Browser, BrowserContext, Page } from "patchright";
-import { saveCookies, loadCookies, getAuthState, AuthState } from "./auth.js";
+import { saveCookies, loadCookies, AuthState } from "./auth.js";
 
 const DOORDASH_BASE_URL = "https://www.doordash.com";
 const DEFAULT_TIMEOUT = 60000;
@@ -130,24 +130,54 @@ async function getContext(): Promise<BrowserContext> {
 }
 
 /**
+ * Where an /orders visit lands once the redirects settle. Split out from the
+ * navigation so it is testable without a live session.
+ */
+export function isAuthedUrl(url: string): boolean {
+  const { hostname, pathname } = new URL(url);
+  return (
+    (hostname === "doordash.com" || hostname.endsWith(".doordash.com")) &&
+    !hostname.startsWith("identity.") &&
+    !pathname.includes("/login")
+  );
+}
+
+/**
+ * Assert DoorDash still knows us, rather than that a cookie with the right
+ * name exists - an expired session cookie is still a cookie, and that false
+ * positive is exactly what the stale-session warning exists to catch.
+ *
+ * /orders is auth-gated and bounces through identity.doordash.com with
+ * prompt=none: a live session is returned silently, a dead one is parked on
+ * the login form. So the final URL is the answer.
+ */
+export async function sessionIsLive(page: Page): Promise<boolean> {
+  await page.goto(`${DOORDASH_BASE_URL}/orders`, {
+    waitUntil: "domcontentloaded",
+    timeout: DEFAULT_TIMEOUT,
+  });
+  // Both hops are awaited separately: waiting only for the landing would race
+  // the bounce and read the pre-bounce URL as a live session. Either wait may
+  // legitimately time out (no bounce; or parked on the login form), so a
+  // timeout is not an error - the URL we end on is.
+  await page.waitForURL(/identity\.doordash\.com/, { timeout: 10000 }).catch(() => {});
+  await page.waitForURL(/\/\/www\.doordash\.com\//, { timeout: 10000 }).catch(() => {});
+  return isAuthedUrl(page.url());
+}
+
+/**
  * Check if user is logged in
  */
 export async function checkAuth(): Promise<AuthState> {
   const ctx = await getContext();
   const p = await getPage();
-  
-  // Navigate to DoorDash to check auth state
-  await p.goto(DOORDASH_BASE_URL, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-  
-  // Wait for page to stabilize
-  await p.waitForTimeout(3000);
-  
-  const authState = await getAuthState(ctx);
-  
+
+  const isLoggedIn = await sessionIsLive(p);
+
   // Save cookies after check
   await saveCookies(ctx);
-  
-  return authState;
+
+  return { isLoggedIn };
 }
 
 /**

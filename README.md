@@ -180,7 +180,11 @@ An idle container's DoorDash session goes stale quietly, and you find out when y
 Heartbeat: DoorDash session is stale. Re-run `npm run login` and restart.
 ```
 
+The check loads the auth-gated `/orders` page and sees where the redirect lands, rather than looking for a cookie by name — an expired session cookie is still a cookie, and trusting the name is how a dead session reports itself as healthy.
+
 Each beat is jittered ±25% so the traffic isn't a metronome, and a beat is skipped entirely if any tool ran during the interval — those already refreshed the cookies, and the check navigates the single shared browser tab, which would strand a caller between `doordash_menu` and `doordash_add_to_cart`.
+
+Consecutive failures double the wait, up to 24 hours. Nothing a beat does fixes a stale session or an IP DoorDash has started blocking, so beating at full rate is just more of whatever caused it. The warning above repeats on that slower schedule until you re-run `npm run login`.
 
 For Kubernetes, `npm run login -- --secret-name doordash-cookies --namespace my-namespace` prints the `kubectl` command to create the Secret from those cookies. Mount it at `/secrets`.
 

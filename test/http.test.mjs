@@ -17,6 +17,15 @@ process.env.MCP_HTTP_PORT = String(PORT);
 process.env.MCP_HTTP_TOKEN = TOKEN;
 
 const { serialize, startHeartbeat, noteToolActivity } = await import("../dist/index.js");
+const { isAuthedUrl } = await import("../dist/browser.js");
+
+// --- session probe ----------------------------------------------------------
+// Real URLs: the second is where /orders lands with a dead session (prompt=none
+// silent SSO falls through to the login form).
+assert.ok(isAuthedUrl("https://www.doordash.com/orders/"));
+assert.ok(!isAuthedUrl("https://identity.doordash.com/auth?client_id=1666519390426295040&prompt=none&redirect_uri=https%3A%2F%2Fwww.doordash.com%2Fpost-login%2F"));
+assert.ok(!isAuthedUrl("https://www.doordash.com/consumer/login/"));
+assert.ok(!isAuthedUrl("https://doordash.com.evil.example/orders/"));
 
 // --- mutex -----------------------------------------------------------------
 const log = [];
@@ -81,6 +90,30 @@ const afterBusy = beats;
 const quietUntil = Date.now() + 8000;
 while (beats === afterBusy && Date.now() < quietUntil) await new Promise((r) => setTimeout(r, 50));
 assert.ok(beats > afterBusy, "heartbeat did not resume after the tools went quiet");
+
+// --- heartbeat backoff ------------------------------------------------------
+// A failing probe must not keep beating at full rate: nothing a beat does fixes
+// a stale session, so each consecutive failure doubles the wait.
+const FAIL_HOURS = 0.0002; // 0.72s nominal
+const failAt = [];
+startHeartbeat(FAIL_HOURS, async () => {
+  failAt.push(Date.now());
+  return { isLoggedIn: false };
+});
+const failStart = Date.now();
+while (failAt.length < 4 && Date.now() - failStart < 20000) await new Promise((r) => setTimeout(r, 25));
+assert.ok(failAt.length >= 4, `backoff heartbeat did not beat enough (${failAt.length})`);
+
+// The first beat fires at 1x, so the observed gaps are already 2x, 4x, 4x.
+// Jitter is +/-25%, so the 2x and 4x bands cannot overlap: the growth is real,
+// and the cap holding is what stops a blocked container backing off to never.
+const FAIL_NOMINAL = FAIL_HOURS * 3600_000;
+const failGaps = failAt.slice(1, 4).map((t, i) => t - failAt[i]);
+assert.ok(failGaps[1] > failGaps[0], `failing beats did not back off: ${failGaps}`);
+assert.ok(
+  failGaps.every((g) => g <= FAIL_NOMINAL * 4 * 1.25 + 500),
+  `backoff blew past the 4x cap: ${failGaps}`
+);
 
 // --- http ------------------------------------------------------------------
 const post = (body, token) =>
