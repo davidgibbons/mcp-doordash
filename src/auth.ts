@@ -12,6 +12,7 @@ import type { BrowserContext, Cookie } from "patchright";
 // Default cookie storage location
 const CONFIG_DIR = join(homedir(), ".config", "striderlabs-mcp-doordash");
 const COOKIES_FILE = join(CONFIG_DIR, "cookies.json");
+const PROFILE_DIR = join(CONFIG_DIR, "chrome-profile");
 
 export interface AuthState {
   isLoggedIn: boolean;
@@ -92,6 +93,20 @@ export function hasStoredCookies(): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Chrome profile directory. Patchright is least detectable driving a real
+ * Chrome with a persistent profile, and the profile keeps the session across
+ * restarts on its own - cookies.json stays because it is what ships to a
+ * container, not because the local browser needs it.
+ *
+ * Chrome locks a profile to one process, and a second one fails with an
+ * unhelpful "target has been closed". DOORDASH_PROFILE_DIR lets a second
+ * browser on the same machine - the login helper - keep out of the way.
+ */
+export function getProfilePath(): string {
+  return process.env.DOORDASH_PROFILE_DIR || PROFILE_DIR;
 }
 
 /**

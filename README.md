@@ -134,7 +134,8 @@ status = track_order({ order_id: order.order_id })
 | `MCP_HTTP_PORT` | unset | Serve Streamable HTTP on this port instead of stdio |
 | `MCP_HTTP_TOKEN` | — | Bearer token clients must present. Required when `MCP_HTTP_PORT` is set |
 | `MCP_HTTP_HOST` | `127.0.0.1` | Interface to bind |
-| `DOORDASH_HEADLESS` | unset | Set to `1` to run Chromium headless |
+| `DOORDASH_HEADLESS` | unset | Set to `1` to run the browser headless |
+| `DOORDASH_PROFILE_DIR` | `~/.config/striderlabs-mcp-doordash/chrome-profile` | Chrome profile to drive. Chrome locks one to a single process, so a second browser on the same machine needs its own |
 | `DOORDASH_HEARTBEAT_HOURS` | unset (`6` in the image) | Hours between session-keepalive beats. `0` or unset disables |
 
 ### Self-Hosted
@@ -143,13 +144,24 @@ status = track_order({ order_id: order.order_id })
 git clone https://github.com/striderlabsdev/mcp-doordash
 cd mcp-doordash
 npm install
+npx patchright install chrome   # see The browser, below
 npm run build
 npm start   # stdio
 ```
 
+### The browser
+
+The server drives your real Google Chrome through a persistent profile in `~/.config/striderlabs-mcp-doordash/chrome-profile`, which is the configuration patchright documents as least detectable. It deliberately sets no `userAgent` and no fixed viewport: a spoofed user agent that disagrees with the browser actually running is a tell, not a disguise.
+
+Without Chrome installed it falls back to bundled Chromium and logs that it did. That works, but it is easier for DoorDash to spot — `npx patchright install chrome` is worth the one-time download.
+
+The profile also keeps the session on its own, so logging in locally tends to stick across restarts without any cookie shuffling.
+
 ### Docker
 
-The image serves Streamable HTTP on port 3000 and runs a **headed** Chromium against an Xvfb virtual framebuffer — DoorDash's bot detection is easier to trip in headless mode, and a framebuffer costs less than being blocked.
+The image serves Streamable HTTP on port 3000 and runs a **headed** browser against an Xvfb virtual framebuffer — DoorDash's bot detection is easier to trip in headless mode, and a framebuffer costs less than being blocked.
+
+Google Chrome ships no Linux arm64 build, so arm64 images get Chromium and take the fallback above. Build for `--platform=linux/amd64` if you want the quieter browser in the container.
 
 ```bash
 docker build -t mcp-doordash .
@@ -160,6 +172,7 @@ npm run build && npm run login
 docker run -d --name doordash -p 3000:3000 \
   -e MCP_HTTP_TOKEN="$(openssl rand -hex 32)" \
   -v ~/.config/striderlabs-mcp-doordash:/secrets:ro \
+  -v doordash-session:/root/.config/striderlabs-mcp-doordash \
   --shm-size=1g \
   mcp-doordash
 ```
@@ -168,7 +181,9 @@ Point a client at `http://127.0.0.1:3000/` with `Authorization: Bearer <token>`.
 
 `--shm-size=1g` matters: Chromium's default 64 MB of shared memory in Docker causes tab crashes on heavy pages.
 
-The container copies `/secrets/cookies.json` to a writable path at startup, so it can refresh the session as it runs. Those refreshes are lost on restart — DoorDash sessions expire, so re-run `npm run login` and restart the container when it goes stale.
+The two mounts do different jobs. `/secrets` is the read-only cookies from `npm run login`, used to seed the first boot. The `doordash-session` volume holds the live session — both the refreshed cookies and the Chrome profile — and it's what makes the seed a one-time step: without it every restart falls back to the original cookies and you re-login far more often. On Kubernetes, that volume is a PVC and `/secrets` is the Secret.
+
+Sessions still expire eventually — re-run `npm run login`, then `docker volume rm doordash-session` so the new cookies get picked up.
 
 `GET /healthz` returns 200 without a token for liveness probes. It reports only that the process is up, not that DoorDash still knows you — that's the heartbeat's job.
 

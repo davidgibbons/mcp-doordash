@@ -5,7 +5,7 @@
  */
 
 import { chromium, Browser, BrowserContext, Page } from "patchright";
-import { saveCookies, loadCookies, AuthState } from "./auth.js";
+import { saveCookies, loadCookies, getProfilePath, AuthState } from "./auth.js";
 
 const DOORDASH_BASE_URL = "https://www.doordash.com";
 const DEFAULT_TIMEOUT = 60000;
@@ -76,41 +76,59 @@ async function initBrowser(): Promise<void> {
     page = null;
   }
 
-  browser = await chromium.launch({
-    // Visible by default so the interactive login flow works. Hosted
-    // deployments set DOORDASH_HEADLESS=1; patchright's stealth is weaker
-    // headless, so verify DoorDash still serves you before relying on it.
-    headless: process.env.DOORDASH_HEADLESS === "1",
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process",
-    ],
-  });
-
-  context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 800 },
-    locale: "en-US",
-    timezoneId: "America/Los_Angeles",
-  });
+  context = await launchContext();
+  browser = context.browser();
 
   // Load saved cookies
   await loadCookies(context);
 
-  page = await context.newPage();
-  
+  // A persistent context opens with a page already; using it avoids a stray
+  // blank tab sitting next to the one we drive.
+  page = context.pages()[0] ?? (await context.newPage());
+
   // Set default timeout
   page.setDefaultTimeout(DEFAULT_TIMEOUT);
 }
 
 /**
+ * Patchright's documented undetected configuration: real Chrome, a persistent
+ * profile, and no fingerprint injection. A spoofed userAgent or a pinned
+ * viewport is a tell rather than a disguise, so neither is set - the honest
+ * values are the quiet ones. locale and timezone stay because they describe
+ * where the account really is; a container reporting UTC is its own mismatch.
+ */
+async function launchContext(): Promise<BrowserContext> {
+  const options = {
+    // Visible by default so the interactive login flow works. Hosted
+    // deployments set DOORDASH_HEADLESS=1; patchright's stealth is weaker
+    // headless, so verify DoorDash still serves you before relying on it.
+    headless: process.env.DOORDASH_HEADLESS === "1",
+    viewport: null,
+    locale: "en-US",
+    timezoneId: "America/Los_Angeles",
+    // Chrome refuses to run as root, which is how the container runs it.
+    // It is also a detectability tell, so it is not passed when we are not root.
+    args: process.getuid?.() === 0 ? ["--no-sandbox"] : [],
+  };
+
+  try {
+    return await chromium.launchPersistentContext(getProfilePath(), {
+      ...options,
+      channel: "chrome",
+    });
+  } catch (error) {
+    console.error(
+      "Google Chrome unavailable, falling back to bundled Chromium - more detectable. Install it with `npx patchright install chrome`.",
+      error
+    );
+    return await chromium.launchPersistentContext(getProfilePath(), options);
+  }
+}
+
+/**
  * Get the current page, initializing if needed
  */
-async function getPage(): Promise<Page> {
+export async function getPage(): Promise<Page> {
   await initBrowser();
   if (page?.isClosed() && context) {
     page = await context.newPage();
@@ -895,8 +913,9 @@ export async function cleanup(): Promise<void> {
   if (context) {
     await saveCookies(context);
   }
-  if (browser) {
-    await browser.close();
+  if (context) {
+    // A persistent context owns its browser; closing it closes both.
+    await context.close();
     browser = null;
     context = null;
     page = null;
