@@ -12,8 +12,20 @@
  * Usage: node bin/login-and-export-cookies.mjs [--secret-name NAME] [--namespace NS]
  */
 
-import { chromium } from "patchright";
-import { loadCookies, saveCookies, getCookiesPath } from "../dist/auth.js";
+// Forced headed: this flow only works if you can see the browser, whatever
+// the environment says. Both are read when the browser launches, below, not
+// at import - ESM hoists the imports above these assignments.
+process.env.DOORDASH_HEADLESS = "0";
+// Own profile, because Chrome locks one to a single process and a server
+// already running on this machine holds the default.
+process.env.DOORDASH_PROFILE_DIR ||= join(
+  dirname(getCookiesPath()),
+  "chrome-profile-login"
+);
+
+import { dirname, join } from "node:path";
+import { getCookiesPath } from "../dist/auth.js";
+import { getPage, sessionIsLive, isAuthedUrl, cleanup } from "../dist/browser.js";
 
 const DOORDASH_BASE_URL = "https://www.doordash.com";
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -27,7 +39,10 @@ function parseArgs(argv) {
   return opts;
 }
 
-async function isLoggedIn(page) {
+// Weak on purpose: used only to spot that the login form is gone, so polling
+// never navigates and never interrupts an in-progress email/OTP entry.
+// sessionIsLive() is what actually decides, once below.
+async function signInGone(page) {
   const signInVisible = await page
     .locator('button:has-text("Sign In"), a:has-text("Sign In"), text="Sign in or Sign up"')
     .first()
@@ -40,26 +55,9 @@ async function main() {
   const { secretName, namespace } = parseArgs(process.argv.slice(2));
   const cookiesPath = getCookiesPath();
 
-  const browser = await chromium.launch({
-    headless: false,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process",
-    ],
-  });
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 800 },
-    locale: "en-US",
-    timezoneId: "America/Los_Angeles",
-  });
-  await loadCookies(context);
-  const page = await context.newPage();
-  page.setDefaultTimeout(60000);
+  // The server's own launcher, so you log in through the same stealth setup
+  // it uses. cookies.json is the handoff; the profile stays separate.
+  const page = await getPage();
 
   await page.goto(`${DOORDASH_BASE_URL}/consumer/login`, { waitUntil: "domcontentloaded" });
   console.log("Log in to DoorDash in the browser window that just opened...");
@@ -70,28 +68,27 @@ async function main() {
   // entry never gets interrupted mid-flow.
   while (Date.now() - start < LOGIN_TIMEOUT_MS) {
     await page.waitForTimeout(4000);
-    loggedIn = (await isLoggedIn(page)) && !page.url().includes("/consumer/login");
+    // /consumer/login redirects to identity.doordash.com, so "are we still on
+    // the login URL?" has to ask about the host, not a fixed path.
+    loggedIn = isAuthedUrl(page.url()) && (await signInGone(page));
     if (loggedIn) break;
   }
 
   if (!loggedIn) {
     console.error("Timed out waiting for login.");
-    await browser.close();
+    await cleanup();
     process.exit(1);
   }
 
-  // One confirmatory check on the homepage to rule out false positives
-  // (e.g. a transient state on the login page itself).
-  await page.goto(DOORDASH_BASE_URL, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2000);
-  if (!(await isLoggedIn(page))) {
+  // Then prove the session actually works, rather than trusting a missing button.
+  if (!(await sessionIsLive(page))) {
     console.error("Login did not persist - please try again.");
-    await browser.close();
+    await cleanup();
     process.exit(1);
   }
 
-  await saveCookies(context);
-  await browser.close();
+  // cleanup() saves the cookies on its way out.
+  await cleanup();
 
   console.log(`\nLogged in. Cookies saved to: ${cookiesPath}\n`);
   console.log("Run this to create/update the k8s Secret:\n");

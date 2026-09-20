@@ -129,27 +129,95 @@ status = track_order({ order_id: order.order_id })
 
 ### Environment Variables
 
-```bash
-# Optional: Use a specific DoorDash account
-DOORDASH_EMAIL=your-email@example.com
-DOORDASH_PASSWORD=your-password  # Highly recommend using .env file
-```
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MCP_HTTP_PORT` | unset | Serve Streamable HTTP on this port instead of stdio |
+| `MCP_HTTP_TOKEN` | — | Bearer token clients must present. Required when `MCP_HTTP_PORT` is set |
+| `MCP_HTTP_HOST` | `127.0.0.1` | Interface to bind |
+| `DOORDASH_HEADLESS` | unset | Set to `1` to run the browser headless |
+| `DOORDASH_PROFILE_DIR` | `~/.config/striderlabs-mcp-doordash/chrome-profile` | Chrome profile to drive. Chrome locks one to a single process, so a second browser on the same machine needs its own |
+| `DOORDASH_HEARTBEAT_HOURS` | unset (`6` in the image) | Hours between session-keepalive beats. `0` or unset disables |
 
 ### Self-Hosted
 
 ```bash
-# Clone the repo
 git clone https://github.com/striderlabsdev/mcp-doordash
 cd mcp-doordash
-
-# Install dependencies
 npm install
-
-# Start the server
-npm start
-
-# Your agent can now connect to localhost:3000
+npx patchright install chrome   # see The browser, below
+npm run build
+npm start   # stdio
 ```
+
+### The browser
+
+The server drives your real Google Chrome through a persistent profile in `~/.config/striderlabs-mcp-doordash/chrome-profile`, which is the configuration patchright documents as least detectable. It deliberately sets no `userAgent` and no fixed viewport: a spoofed user agent that disagrees with the browser actually running is a tell, not a disguise.
+
+Without Chrome installed it falls back to bundled Chromium and logs that it did. That works, but it is easier for DoorDash to spot — `npx patchright install chrome` is worth the one-time download.
+
+The profile also keeps the session on its own, so logging in locally tends to stick across restarts without any cookie shuffling.
+
+### Docker
+
+The image serves Streamable HTTP on port 3000 and runs a **headed** browser against an Xvfb virtual framebuffer — DoorDash's bot detection is easier to trip in headless mode, and a framebuffer costs less than being blocked.
+
+Google Chrome ships no Linux arm64 build, so arm64 images get Chromium and take the fallback above. Build for `--platform=linux/amd64` if you want the quieter browser in the container.
+
+```bash
+docker build -t mcp-doordash .
+
+# Log in once on your own machine; this writes the cookies the container reads.
+npm run build && npm run login
+
+docker run -d --name doordash -p 3000:3000 \
+  -e MCP_HTTP_TOKEN="$(openssl rand -hex 32)" \
+  -v ~/.config/striderlabs-mcp-doordash:/secrets:ro \
+  -v doordash-session:/root/.config/striderlabs-mcp-doordash \
+  --shm-size=1g \
+  mcp-doordash
+```
+
+Point a client at `http://127.0.0.1:3000/` with `Authorization: Bearer <token>`.
+
+`--shm-size=1g` matters: Chromium's default 64 MB of shared memory in Docker causes tab crashes on heavy pages.
+
+The two mounts do different jobs. `/secrets` is the read-only cookies from `npm run login`, used to seed the first boot. The `doordash-session` volume holds the live session — both the refreshed cookies and the Chrome profile — and it's what makes the seed a one-time step: without it every restart falls back to the original cookies and you re-login far more often. On Kubernetes, that volume is a PVC and `/secrets` is the Secret.
+
+Sessions still expire eventually — re-run `npm run login`, then `docker volume rm doordash-session` so the new cookies get picked up.
+
+`GET /healthz` returns 200 without a token for liveness probes. It reports only that the process is up, not that DoorDash still knows you — that's the heartbeat's job.
+
+### Session heartbeat
+
+An idle container's DoorDash session goes stale quietly, and you find out when you're hungry. Every `DOORDASH_HEARTBEAT_HOURS` (6 in the image) the server re-checks the session and re-saves the cookies, which keeps a rolling session alive and logs a clear warning once it can't be saved:
+
+```
+Heartbeat: DoorDash session is stale. Re-run `npm run login` and restart.
+```
+
+The check loads the auth-gated `/orders` page and sees where the redirect lands, rather than looking for a cookie by name — an expired session cookie is still a cookie, and trusting the name is how a dead session reports itself as healthy.
+
+Each beat is jittered ±25% so the traffic isn't a metronome, and a beat is skipped entirely if any tool ran during the interval — those already refreshed the cookies, and the check navigates the single shared browser tab, which would strand a caller between `doordash_menu` and `doordash_add_to_cart`.
+
+Consecutive failures double the wait, up to 24 hours. Nothing a beat does fixes a stale session or an IP DoorDash has started blocking, so beating at full rate is just more of whatever caused it. The warning above repeats on that slower schedule until you re-run `npm run login`.
+
+For Kubernetes, `npm run login -- --secret-name doordash-cookies --namespace my-namespace` prints the `kubectl` command to create the Secret from those cookies. Mount it at `/secrets`.
+
+### HTTP transport without Docker
+
+Set `MCP_HTTP_PORT` and the server speaks Streamable HTTP instead of stdio:
+
+```bash
+MCP_HTTP_PORT=3000 MCP_HTTP_TOKEN="$(openssl rand -hex 32)" npm start
+```
+
+Without a framebuffer, either keep a display attached or set `DOORDASH_HEADLESS=1` and accept the higher chance of being flagged.
+
+### What you are hosting
+
+- **This server spends money.** Anyone who can reach the port and present the token can place orders on your account. The server refuses to start in HTTP mode without a token, and binds to loopback unless you change `MCP_HTTP_HOST` (the image sets `0.0.0.0`, so publish the port only where you trust the network, and put TLS in front of it if it leaves the host).
+- **One DoorDash account, shared.** Cookies live in a single file, so every caller acts as whoever logged in. This is a personal deployment, not a multi-user service.
+- **Calls are serialized.** All tools drive one browser tab, so concurrent requests queue rather than run in parallel.
 
 ## Architecture
 

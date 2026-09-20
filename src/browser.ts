@@ -5,7 +5,7 @@
  */
 
 import { chromium, Browser, BrowserContext, Page } from "patchright";
-import { saveCookies, loadCookies, getAuthState, AuthState } from "./auth.js";
+import { saveCookies, loadCookies, getProfilePath, AuthState } from "./auth.js";
 
 const DOORDASH_BASE_URL = "https://www.doordash.com";
 const DEFAULT_TIMEOUT = 60000;
@@ -64,41 +64,76 @@ export interface OrderStatus {
  * Initialize browser with stealth settings
  */
 async function initBrowser(): Promise<void> {
-  if (browser) return;
+  if (browser?.isConnected()) return;
 
-  browser = await chromium.launch({
-    headless: false,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process",
-    ],
-  });
+  // Chromium dies under long-running containers (OOM, a crashed tab, a stray
+  // SIGKILL). Without this the stale handle is truthy forever and every later
+  // call fails until someone restarts the process.
+  if (browser) {
+    console.error("Browser disconnected - relaunching.");
+    browser = null;
+    context = null;
+    page = null;
+  }
 
-  context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 800 },
-    locale: "en-US",
-    timezoneId: "America/Los_Angeles",
-  });
+  context = await launchContext();
+  browser = context.browser();
 
   // Load saved cookies
   await loadCookies(context);
 
-  page = await context.newPage();
-  
+  // A persistent context opens with a page already; using it avoids a stray
+  // blank tab sitting next to the one we drive.
+  page = context.pages()[0] ?? (await context.newPage());
+
   // Set default timeout
   page.setDefaultTimeout(DEFAULT_TIMEOUT);
 }
 
 /**
+ * Patchright's documented undetected configuration: real Chrome, a persistent
+ * profile, and no fingerprint injection. A spoofed userAgent or a pinned
+ * viewport is a tell rather than a disguise, so neither is set - the honest
+ * values are the quiet ones. locale and timezone stay because they describe
+ * where the account really is; a container reporting UTC is its own mismatch.
+ */
+async function launchContext(): Promise<BrowserContext> {
+  const options = {
+    // Visible by default so the interactive login flow works. Hosted
+    // deployments set DOORDASH_HEADLESS=1; patchright's stealth is weaker
+    // headless, so verify DoorDash still serves you before relying on it.
+    headless: process.env.DOORDASH_HEADLESS === "1",
+    viewport: null,
+    locale: "en-US",
+    timezoneId: "America/Los_Angeles",
+    // Chrome refuses to run as root, which is how the container runs it.
+    // It is also a detectability tell, so it is not passed when we are not root.
+    args: process.getuid?.() === 0 ? ["--no-sandbox"] : [],
+  };
+
+  try {
+    return await chromium.launchPersistentContext(getProfilePath(), {
+      ...options,
+      channel: "chrome",
+    });
+  } catch (error) {
+    console.error(
+      "Google Chrome unavailable, falling back to bundled Chromium - more detectable. Install it with `npx patchright install chrome`.",
+      error
+    );
+    return await chromium.launchPersistentContext(getProfilePath(), options);
+  }
+}
+
+/**
  * Get the current page, initializing if needed
  */
-async function getPage(): Promise<Page> {
+export async function getPage(): Promise<Page> {
   await initBrowser();
+  if (page?.isClosed() && context) {
+    page = await context.newPage();
+    page.setDefaultTimeout(DEFAULT_TIMEOUT);
+  }
   if (!page) throw new Error("Page not initialized");
   return page;
 }
@@ -113,24 +148,54 @@ async function getContext(): Promise<BrowserContext> {
 }
 
 /**
+ * Where an /orders visit lands once the redirects settle. Split out from the
+ * navigation so it is testable without a live session.
+ */
+export function isAuthedUrl(url: string): boolean {
+  const { hostname, pathname } = new URL(url);
+  return (
+    (hostname === "doordash.com" || hostname.endsWith(".doordash.com")) &&
+    !hostname.startsWith("identity.") &&
+    !pathname.includes("/login")
+  );
+}
+
+/**
+ * Assert DoorDash still knows us, rather than that a cookie with the right
+ * name exists - an expired session cookie is still a cookie, and that false
+ * positive is exactly what the stale-session warning exists to catch.
+ *
+ * /orders is auth-gated and bounces through identity.doordash.com with
+ * prompt=none: a live session is returned silently, a dead one is parked on
+ * the login form. So the final URL is the answer.
+ */
+export async function sessionIsLive(page: Page): Promise<boolean> {
+  await page.goto(`${DOORDASH_BASE_URL}/orders`, {
+    waitUntil: "domcontentloaded",
+    timeout: DEFAULT_TIMEOUT,
+  });
+  // Both hops are awaited separately: waiting only for the landing would race
+  // the bounce and read the pre-bounce URL as a live session. Either wait may
+  // legitimately time out (no bounce; or parked on the login form), so a
+  // timeout is not an error - the URL we end on is.
+  await page.waitForURL(/identity\.doordash\.com/, { timeout: 10000 }).catch(() => {});
+  await page.waitForURL(/\/\/www\.doordash\.com\//, { timeout: 10000 }).catch(() => {});
+  return isAuthedUrl(page.url());
+}
+
+/**
  * Check if user is logged in
  */
 export async function checkAuth(): Promise<AuthState> {
   const ctx = await getContext();
   const p = await getPage();
-  
-  // Navigate to DoorDash to check auth state
-  await p.goto(DOORDASH_BASE_URL, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-  
-  // Wait for page to stabilize
-  await p.waitForTimeout(3000);
-  
-  const authState = await getAuthState(ctx);
-  
+
+  const isLoggedIn = await sessionIsLive(p);
+
   // Save cookies after check
   await saveCookies(ctx);
-  
-  return authState;
+
+  return { isLoggedIn };
 }
 
 /**
@@ -848,8 +913,9 @@ export async function cleanup(): Promise<void> {
   if (context) {
     await saveCookies(context);
   }
-  if (browser) {
-    await browser.close();
+  if (context) {
+    // A persistent context owns its browser; closing it closes both.
+    await context.close();
     browser = null;
     context = null;
     page = null;

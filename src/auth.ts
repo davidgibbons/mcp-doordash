@@ -12,6 +12,7 @@ import type { BrowserContext, Cookie } from "patchright";
 // Default cookie storage location
 const CONFIG_DIR = join(homedir(), ".config", "striderlabs-mcp-doordash");
 const COOKIES_FILE = join(CONFIG_DIR, "cookies.json");
+const PROFILE_DIR = join(CONFIG_DIR, "chrome-profile");
 
 export interface AuthState {
   isLoggedIn: boolean;
@@ -33,9 +34,16 @@ function ensureConfigDir(): void {
  * Save cookies from browser context to disk
  */
 export async function saveCookies(context: BrowserContext): Promise<void> {
-  ensureConfigDir();
   const cookies = await context.cookies();
-  writeFileSync(COOKIES_FILE, JSON.stringify(cookies, null, 2));
+  try {
+    ensureConfigDir();
+    writeFileSync(COOKIES_FILE, JSON.stringify(cookies, null, 2));
+  } catch (error) {
+    // Every tool refreshes cookies after it runs. A read-only cookie store (a
+    // Secret mounted straight onto the file) must not fail the order that just
+    // succeeded - the in-memory session keeps working until the process exits.
+    console.error("Could not persist cookies:", error);
+  }
 }
 
 /**
@@ -88,37 +96,17 @@ export function hasStoredCookies(): boolean {
 }
 
 /**
- * Extract auth state from DoorDash page
+ * Chrome profile directory. Patchright is least detectable driving a real
+ * Chrome with a persistent profile, and the profile keeps the session across
+ * restarts on its own - cookies.json stays because it is what ships to a
+ * container, not because the local browser needs it.
+ *
+ * Chrome locks a profile to one process, and a second one fails with an
+ * unhelpful "target has been closed". DOORDASH_PROFILE_DIR lets a second
+ * browser on the same machine - the login helper - keep out of the way.
  */
-export async function getAuthState(context: BrowserContext): Promise<AuthState> {
-  const cookies = await context.cookies("https://www.doordash.com");
-  
-  // Check for session cookies that indicate logged in state.
-  // Includes current cookie names as well as legacy names kept for backwards compatibility.
-  const SESSION_COOKIE_NAMES = new Set([
-    "consumer_session",   // current primary session cookie
-    "Cx-Auth-Token",      // current auth token cookie
-    "cx_auth_token",      // alternate casing
-    "dd_session",         // legacy
-    "ddsid",              // legacy
-    "dd_login",           // legacy
-  ]);
-  const hasSessionCookie = cookies.some((c) => SESSION_COOKIE_NAMES.has(c.name));
-
-  // Also check for user ID cookie (current and legacy names).
-  const userIdCookie = cookies.find(
-    (c) => c.name === "consumer_id" || c.name === "dd_user_id"
-  );
-  
-  if (hasSessionCookie || userIdCookie) {
-    return {
-      isLoggedIn: true,
-    };
-  }
-  
-  return {
-    isLoggedIn: false,
-  };
+export function getProfilePath(): string {
+  return process.env.DOORDASH_PROFILE_DIR || PROFILE_DIR;
 }
 
 /**
